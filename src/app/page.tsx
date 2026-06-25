@@ -110,11 +110,6 @@ interface GameState {
   // upgrades
   ergonomicDesk: number;
   incomePerSecond: number;
-  espressoMachine: number;
-  deepFocusGuide: number;
-  automationSpeed: number;
-  lunchBox: number;
-  waterBottle: number;
   // recovery
   activeRecovery: string | null;
   recoveryProgress: number;
@@ -153,7 +148,7 @@ interface GamblingModalProps {
   addLog: (text: string, color?: string) => void;
 }
 
-type UpgradeKey = "ergonomicDesk" | "incomePerSecond" | "espressoMachine" | "deepFocusGuide" | "automationSpeed" | "lunchBox" | "waterBottle";
+type UpgradeKey = "ergonomicDesk" | "incomePerSecond";
 
 // ─── Gambling Outcomes ───────────────────────────────────────────────────────
 const GAMBLE_OUTCOMES: GambleOutcome[] = [
@@ -224,11 +219,6 @@ const F = {
 const UPGRADES: Record<UpgradeKey, UpgradeDef> = {
   ergonomicDesk:   { name: "Ergonomic Desk",     desc: "Boosts shift completion bonus",              icon: Monitor, color: P.blue,   baseCost: 80,  costScale: 1.7, effect: (l) => `+$${l*100} per shift bonus` },
   incomePerSecond: { name: "Mechanical Keyboard", desc: "Increases base currency per second",         icon: Zap,     color: P.yellow, baseCost: 50,  costScale: 1.5, effect: (l) => `+$${(l*0.5).toFixed(1)}/sec base` },
-  espressoMachine: { name: "Espresso Machine",    desc: "Reduces mana drain while working",           icon: Coffee,  color: P.pink,   baseCost: 120, costScale: 1.8, effect: (l) => `-${Math.min(l*10,60)}% mana drain` },
-  deepFocusGuide:  { name: "Deep Focus Guide",    desc: "Slows productivity multiplier decay",        icon: Brain,   color: P.purple, baseCost: 200, costScale: 2.0, effect: (l) => `-${Math.min(l*10,60)}% decay rate` },
-  automationSpeed: { name: "Turbo Workflow",      desc: "Increases per-second income while working",  icon: Rocket,  color: P.green,  baseCost: 150, costScale: 1.9, effect: (l) => `+${(l*0.25).toFixed(2)}x income speed` },
-  lunchBox:        { name: "Insulated Lunchbox",  desc: "Slows energy decay — hunger drains slower",  icon: Utensils,color: P.orange, baseCost: 90,  costScale: 1.6, effect: (l) => `-${Math.min(l*10,50)}% energy decay` },
-  waterBottle:     { name: "Hydration Bottle",    desc: "Each water drink restores extra energy",     icon: Droplets,color: P.cyan,   baseCost: 60,  costScale: 1.5, effect: (l) => `+${l*3} energy per drink` },
 };
 
 function upgradeCost(base: number, scale: number, lvl: number): number {
@@ -539,7 +529,7 @@ function fmtHours(totalSecs: number): string {
 function fmtMultiplierTime(pct: number): string { return fmtTime(Math.round((pct / 100) * 57600)); }
 
 // ─── ProgressBar ─────────────────────────────────────────────────────────────
-function ProgressBar({ value, max, color, label, sublabel, icon: Icon, height = 7, warn }: ProgressBarProps): JSX.Element {
+function ProgressBar({ value, max, color, label, sublabel, icon: Icon, height = 7, warn }: ProgressBarProps) {
   const pct = Math.max(0, Math.min(100, (value / max) * 100));
   const effectiveColor = warn && pct < 25 ? P.red : pct < 50 ? P.yellow : color;
   return (
@@ -564,7 +554,7 @@ function ProgressBar({ value, max, color, label, sublabel, icon: Icon, height = 
 }
 
 // ─── Gambling Modal ───────────────────────────────────────────────────────────
-function GamblingModal({ pending, onResult, addLog }: GamblingModalProps): JSX.Element {
+function GamblingModal({ pending, onResult, addLog }: GamblingModalProps) {
   const [spinning, setSpinning]   = useState<boolean>(false);
   const [result, setResult]       = useState<GambleOutcome | null>(null);
   const [revealed, setRevealed]   = useState<boolean>(false);
@@ -715,7 +705,7 @@ function GamblingModal({ pending, onResult, addLog }: GamblingModalProps): JSX.E
 }
 
 // ─── Main Component ───────────────────────────────────────────────────────────
-export default function IdleWorkerGame(): JSX.Element {
+export default function IdleWorkerGame() {
   const [state, setState]             = useState<GameState>(INITIAL_STATE);
   const [tab, setTab]                 = useState<string>("work");
   const [recoveryTab, setRecoveryTab] = useState<string>("nutrition");
