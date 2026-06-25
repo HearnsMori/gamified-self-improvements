@@ -244,7 +244,7 @@ const RECOVERY_ACTIONS: RecoveryAction[] = [
     desc: "Hydration check. Mild dehydration measurably hurts focus — a glass of water is the cheapest fix. Restores a small amount of energy.",
     effect: "Energy +6, Mana +3",
     canDo: (_s: GameState) => true,
-    apply: (s: GameState) => ({ mana: Math.min(s.mana+3, s.maxMana), energy: Math.min(s.energy + 6 + (s.waterBottle||0)*3, s.maxEnergy) }),
+    apply: (s: GameState) => ({ mana: Math.min(s.mana+3, s.maxMana), energy: Math.min(s.energy + 6, s.maxEnergy) }),
     log: "Hydrated! Staying ahead of the drain.", logColor: P.blue,
   },
   {
@@ -402,8 +402,7 @@ const INITIAL_STATE: GameState = {
   workProgress: 0,
   totalWorkSeconds: 0,
   completedCycles: 0,
-  ergonomicDesk: 0, incomePerSecond: 0, espressoMachine: 0,
-  deepFocusGuide: 0, automationSpeed: 0, lunchBox: 0, waterBottle: 0,
+  ergonomicDesk: 0, incomePerSecond: 0,
   activeRecovery: null, recoveryProgress: 0, recoveryMax: 0,
   pendingGamble: null,
 };
