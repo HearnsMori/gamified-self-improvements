@@ -11,17 +11,24 @@ import {
 } from "lucide-react";
 
 // ─── System Overview ─────────────────────────────────────────────────────────
-// OFFLINE PROGRESS APPROACH:
-//   When work starts → save a full "work checkpoint" (state snapshot + timestamp).
-//   When work stops  → clear the checkpoint.
-//   On page reload   → if checkpoint exists, simulate elapsed seconds from
-//                      checkpoint.timestamp to now using checkpoint.state as
-//                      the starting point. No double-counting possible because
-//                      the tick loop only ever runs from the current in-memory
-//                      state, and the checkpoint is the authoritative "what was
-//                      the world when work began this session".
-//   The tick loop itself never writes to the checkpoint — it just mutates
-//   in-memory state per tick. Auto-save writes the current state separately.
+// OFFLINE PROGRESS APPROACH (both Work AND Recovery):
+//
+//   WORK:
+//     When work starts → save a "work checkpoint" (state snapshot + timestamp).
+//     When work stops  → clear the work checkpoint.
+//     On page reload   → if work checkpoint exists, simulate elapsed seconds
+//                        from checkpoint.timestamp to now using checkpoint.state.
+//
+//   RECOVERY:
+//     When recovery starts → save a "recovery checkpoint" (actionId + startTimestamp).
+//     When recovery ends   → clear the recovery checkpoint.
+//     On page reload       → if recovery checkpoint exists, compute elapsed seconds.
+//                            If elapsed >= action.duration → apply effects immediately.
+//                            If elapsed < action.duration → resume with remaining time.
+//
+//   Both checkpoints are independent. If the user was working AND recovering
+//   simultaneously that's impossible (the UI prevents it), but both systems
+//   handle their own catch-up independently.
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 const TICK_MS: number = 250;
@@ -33,6 +40,7 @@ const SHIFT_COMPLETION_BONUS: number = 500;
 const BASE_INCOME_PER_SEC: number = 1.0;
 const SAVE_KEY = "idleWorker_v5";
 const CHECKPOINT_KEY = "idleWorker_v5_checkpoint";
+const RECOVERY_CHECKPOINT_KEY = "idleWorker_v5_recovery_checkpoint";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 interface GambleOutcome {
@@ -123,12 +131,17 @@ interface GameState {
   _levelUp?: number;
 }
 
-// Checkpoint: saved when work starts, cleared when work stops/pauses.
-// On reload, if this exists, we fast-forward from checkpoint.state
-// for (now - checkpoint.timestamp) seconds.
+// Work checkpoint: saved when work starts, cleared when work stops/pauses.
 interface WorkCheckpoint {
   state: GameState;
   timestamp: number; // ms since epoch when work began
+}
+
+// Recovery checkpoint: saved when recovery starts, cleared when it ends.
+interface RecoveryCheckpoint {
+  actionId: string;
+  startTimestamp: number; // ms since epoch when recovery started
+  stateAtStart: GameState; // state snapshot so we can apply effects correctly
 }
 
 interface ProgressBarProps {
@@ -409,7 +422,6 @@ const INITIAL_STATE: GameState = {
 
 // ─── Persistence Helpers ──────────────────────────────────────────────────────
 function encodeState(s: GameState): string {
-  // Strip transient flags before saving
   const { _stopWork, _energyWarn, _warnedEnergy, _levelUp, ...clean } = s;
   return btoa(JSON.stringify(clean));
 }
@@ -418,18 +430,19 @@ function decodeState(str: string): GameState | null {
   try { return JSON.parse(atob(str)) as GameState; } catch { return null; }
 }
 
-function saveCheckpoint(state: GameState): void {
+// ── Work checkpoint helpers ──
+function saveWorkCheckpoint(state: GameState): void {
   try {
     const cp: WorkCheckpoint = { state, timestamp: Date.now() };
     localStorage.setItem(CHECKPOINT_KEY, JSON.stringify(cp));
   } catch { /* ignore */ }
 }
 
-function clearCheckpoint(): void {
+function clearWorkCheckpoint(): void {
   try { localStorage.removeItem(CHECKPOINT_KEY); } catch { /* ignore */ }
 }
 
-function loadCheckpoint(): WorkCheckpoint | null {
+function loadWorkCheckpoint(): WorkCheckpoint | null {
   try {
     const raw = localStorage.getItem(CHECKPOINT_KEY);
     if (!raw) return null;
@@ -437,36 +450,49 @@ function loadCheckpoint(): WorkCheckpoint | null {
   } catch { return null; }
 }
 
+// ── Recovery checkpoint helpers ──
+function saveRecoveryCheckpoint(actionId: string, stateAtStart: GameState): void {
+  try {
+    const cp: RecoveryCheckpoint = { actionId, startTimestamp: Date.now(), stateAtStart };
+    localStorage.setItem(RECOVERY_CHECKPOINT_KEY, JSON.stringify(cp));
+  } catch { /* ignore */ }
+}
+
+function clearRecoveryCheckpoint(): void {
+  try { localStorage.removeItem(RECOVERY_CHECKPOINT_KEY); } catch { /* ignore */ }
+}
+
+function loadRecoveryCheckpoint(): RecoveryCheckpoint | null {
+  try {
+    const raw = localStorage.getItem(RECOVERY_CHECKPOINT_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as RecoveryCheckpoint;
+  } catch { return null; }
+}
+
 // ─── Core Simulation: advance N seconds from a starting state ────────────────
-// This is the single source of truth for "what happens per second".
-// Used both by the tick loop (dt = 0.25s) and offline catch-up (dt = 1s each).
 function simulateSeconds(
   s: GameState,
   seconds: number,
   onShiftComplete?: (baseBonus: number) => void,
 ): GameState {
-  const drainReduction = Math.min((0) * 0.10, 0.60);
-  const focusReduction = Math.min((0) * 0.10, 0.60);
-  const lunchReduction = Math.min((0) * 0.10, 0.50);
-  const speedBonus     = 1;
-  const baseIncome     = BASE_INCOME_PER_SEC + (s.incomePerSecond || 0) * 0.5;
+  const baseIncome = BASE_INCOME_PER_SEC + (s.incomePerSecond || 0) * 0.5;
 
   let { mana, multiplier, energy, currency, workSeconds, totalWorkSeconds, completedCycles } = s;
 
-  // Cap offline sim at 24 hrs to avoid hangs
   const cap = Math.min(Math.floor(seconds), 86400);
 
   for (let t = 0; t < cap; t++) {
     if (mana <= 0) { mana = 0; break; }
 
-    mana        = Math.max(0, mana - MANA_DRAIN_PER_SEC * (1 - drainReduction));
-    multiplier  = Math.max(0, multiplier - MULTIPLIER_DECAY_PER_SEC * (1 - focusReduction));
-    energy      = Math.max(0, energy - ENERGY_DECAY_PER_SEC * (1 - lunchReduction));
+    mana        = Math.max(0, mana - MANA_DRAIN_PER_SEC);
+    multiplier  = Math.max(0, multiplier - MULTIPLIER_DECAY_PER_SEC);
+    energy      = Math.max(0, energy - ENERGY_DECAY_PER_SEC);
 
     const level      = levelFromSecs(totalWorkSeconds);
     const energyFac  = energy / 100;
     const prodFac    = multiplier / 100;
-    const income     = baseIncome * speedBonus * prodFac * energyFac * levelIncomeMultiplier(level);
+    const income     = baseIncome * prodFac * energyFac * levelIncomeMultiplier(level);
     currency        += income;
     workSeconds     += 1;
     totalWorkSeconds += 1;
@@ -494,13 +520,15 @@ function simulateSeconds(
   };
 }
 
-// ─── Offline Progress: called once on cold load ───────────────────────────────
-function applyOfflineProgress(savedState: GameState, checkpoint: WorkCheckpoint, nowMs: number): { state: GameState; elapsedSecs: number; shiftsCompleted: number } {
+// ─── Offline Work Progress ────────────────────────────────────────────────────
+function applyOfflineWorkProgress(
+  savedState: GameState,
+  checkpoint: WorkCheckpoint,
+  nowMs: number,
+): { state: GameState; elapsedSecs: number; shiftsCompleted: number } {
   const elapsedSecs = Math.max(0, (nowMs - checkpoint.timestamp) / 1000);
   if (elapsedSecs < 2) return { state: savedState, elapsedSecs: 0, shiftsCompleted: 0 };
 
-  // Start from the checkpoint state (the world as it was when work began),
-  // then fast-forward elapsed seconds.
   let shiftsCompleted = 0;
   const result = simulateSeconds(
     checkpoint.state,
@@ -509,6 +537,63 @@ function applyOfflineProgress(savedState: GameState, checkpoint: WorkCheckpoint,
   );
 
   return { state: result, elapsedSecs, shiftsCompleted };
+}
+
+// ─── Offline Recovery Progress ────────────────────────────────────────────────
+// Returns the new state and a log message (if recovery completed while away).
+function applyOfflineRecoveryProgress(
+  currentState: GameState,
+  checkpoint: RecoveryCheckpoint,
+  nowMs: number,
+): { state: GameState; logMsg: string | null; logColor: string } {
+  const action = RECOVERY_ACTIONS.find(a => a.id === checkpoint.actionId);
+  if (!action) {
+    // Unknown action — just clear it
+    return { state: { ...currentState, activeRecovery: null, recoveryProgress: 0, recoveryMax: 0 }, logMsg: null, logColor: P.muted };
+  }
+
+  const elapsedSecs = Math.max(0, (nowMs - checkpoint.startTimestamp) / 1000);
+
+  if (elapsedSecs >= action.duration) {
+    // Recovery finished while away — apply its effects to the *current* state
+    // (which may have been updated by work offline progress already)
+    const applied = action.apply(checkpoint.stateAtStart);
+    const newState: GameState = {
+      ...currentState,
+      // Merge recovery benefits, clamping to current maxes
+      mana: Math.min(
+        (applied.mana !== undefined ? applied.mana : currentState.mana),
+        currentState.maxMana,
+      ),
+      energy: Math.min(
+        (applied.energy !== undefined ? applied.energy : currentState.energy),
+        currentState.maxEnergy,
+      ),
+      multiplier: applied.multiplier !== undefined ? applied.multiplier : currentState.multiplier,
+      currency: applied.currency !== undefined ? applied.currency : currentState.currency,
+      activeRecovery: null,
+      recoveryProgress: 0,
+      recoveryMax: 0,
+    };
+    return {
+      state: newState,
+      logMsg: `${action.name} completed while you were away! ${action.log}`,
+      logColor: action.logColor,
+    };
+  } else {
+    // Recovery still in progress — resume with elapsed time already consumed
+    const newState: GameState = {
+      ...currentState,
+      activeRecovery: checkpoint.actionId,
+      recoveryProgress: elapsedSecs,
+      recoveryMax: action.duration,
+    };
+    return {
+      state: newState,
+      logMsg: `Resuming ${action.name} — ${Math.ceil(action.duration - elapsedSecs)}s remaining.`,
+      logColor: action.color,
+    };
+  }
 }
 
 // ─── Format Helpers ───────────────────────────────────────────────────────────
@@ -725,74 +810,79 @@ export default function IdleWorkerGame() {
     setLog((prev: LogEntry[]) => [{ id, text, color }, ...prev].slice(0, 50));
   }, []);
 
-  // ── Cold load: restore state + apply offline progress via checkpoint ──────
+  // ── Cold load: restore state + apply offline progress ────────────────────
   useEffect(() => {
     try {
       const nowMs = Date.now();
-
-      // 1. Load the last auto-saved state (used as fallback / non-working baseline)
       const savedRaw = localStorage.getItem(SAVE_KEY);
       const savedState: GameState = savedRaw ? (decodeState(savedRaw) ?? INITIAL_STATE) : INITIAL_STATE;
 
-      // 2. Load the work checkpoint (set when work was started, cleared when stopped)
-      const checkpoint = loadCheckpoint();
+      let workState = savedState;
+      let workLog: string | null = null;
+      let workLogColor = P.green;
+      let shiftsCompleted = 0;
 
-      if (checkpoint) {
-        // There's a checkpoint → the player had work running when they left.
-        // Fast-forward from the checkpoint state for however long they were away.
-        const { state: result, elapsedSecs, shiftsCompleted } = applyOfflineProgress(savedState, checkpoint, nowMs);
-
-        const finalState: GameState = {
-          ...INITIAL_STATE,
-          ...result,
-          // Recovery doesn't run offline — reset it
-          activeRecovery: null,
-          recoveryProgress: 0,
-          recoveryMax: 0,
-        };
-
-        setState(finalState);
-        stateRef.current = finalState;
-
+      // 1. Apply offline work progress if work was running
+      const workCheckpoint = loadWorkCheckpoint();
+      if (workCheckpoint) {
+        const { state: result, elapsedSecs, shiftsCompleted: sc } = applyOfflineWorkProgress(savedState, workCheckpoint, nowMs);
+        workState = result;
+        shiftsCompleted = sc;
         if (elapsedSecs > 2) {
-          addLog(
-            `Welcome back! Away ${fmtTime(Math.round(elapsedSecs))}${shiftsCompleted > 0 ? ` · ${shiftsCompleted} shift(s) completed` : ""} — progress applied.`,
-            P.green,
-          );
-        } else {
-          addLog("Progress loaded.", P.green);
+          workLog = `Welcome back! Away ${fmtTime(Math.round(elapsedSecs))}${sc > 0 ? ` · ${sc} shift(s) completed` : ""} — work progress applied.`;
+          workLogColor = P.green;
         }
-
-        // If still working after catch-up, write a fresh checkpoint from this moment
-        if (finalState.isWorking) {
-          saveCheckpoint(finalState);
+        if (workState.isWorking) {
+          saveWorkCheckpoint(workState);
         } else {
-          // Mana ran out during offline period
-          clearCheckpoint();
-          addLog("Mana ran out while you were away. Time to recover!", P.red);
+          clearWorkCheckpoint();
         }
-      } else {
-        // No checkpoint → work was paused/stopped when they left. Just restore state.
-        const finalState: GameState = {
-          ...INITIAL_STATE,
-          ...savedState,
-          isWorking: false, // never auto-resume without a checkpoint
-          activeRecovery: null,
-          recoveryProgress: 0,
-        };
-        setState(finalState);
-        stateRef.current = finalState;
-        if (savedRaw) addLog("Progress loaded from auto-save.", P.green);
       }
 
-      prevTitleRef.current = getTitleForHours((stateRef.current.totalWorkSeconds || 0) / 3600).label;
+      // 2. Apply offline recovery progress if recovery was running
+      const recoveryCheckpoint = loadRecoveryCheckpoint();
+      let finalState: GameState = {
+        ...INITIAL_STATE,
+        ...workState,
+        activeRecovery: null,
+        recoveryProgress: 0,
+        recoveryMax: 0,
+      };
+
+      if (recoveryCheckpoint) {
+        const { state: recResult, logMsg, logColor } = applyOfflineRecoveryProgress(finalState, recoveryCheckpoint, nowMs);
+        finalState = recResult;
+
+        // If recovery is still in progress after catch-up, keep the checkpoint updated
+        if (finalState.activeRecovery) {
+          // Update checkpoint timestamp only — action and stateAtStart stay the same
+          // (we don't re-save here; the existing checkpoint is still valid)
+        } else {
+          // Recovery completed — clear the checkpoint
+          clearRecoveryCheckpoint();
+        }
+
+        if (logMsg) {
+          // Log recovery message
+          setTimeout(() => addLog(logMsg, logColor), 50);
+        }
+      }
+
+      setState(finalState);
+      stateRef.current = finalState;
+
+      if (workLog) addLog(workLog, workLogColor);
+      else if (!workCheckpoint && savedRaw) addLog("Progress loaded from auto-save.", P.green);
+      if (!workState.isWorking && workCheckpoint) addLog("Mana ran out while you were away. Time to recover!", P.red);
+
+      prevTitleRef.current = getTitleForHours((finalState.totalWorkSeconds || 0) / 3600).label;
     } catch (e) {
       console.error("Load error", e);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Auto-save current state every 10s ────────────────────────────────────
+  // ── Auto-save every 10s ───────────────────────────────────────────────────
   useEffect(() => {
     const t = setInterval(() => {
       try { localStorage.setItem(SAVE_KEY, encodeState(stateRef.current)); } catch { /* ignore */ }
@@ -800,74 +890,67 @@ export default function IdleWorkerGame() {
     return () => clearInterval(t);
   }, []);
 
-  // ── Visibility change: update checkpoint timestamp on hide/show ────────────
-  // On hide → save current state + update checkpoint timestamp to now.
-  // On show  → apply delta using the updated checkpoint, then refresh checkpoint.
-  // This means the checkpoint always reflects "the state right before we went away".
+  // ── Visibility change: update checkpoints on hide/show ───────────────────
   useEffect(() => {
     const onVis = (): void => {
       if (document.hidden) {
-        // Save current state immediately
         try { localStorage.setItem(SAVE_KEY, encodeState(stateRef.current)); } catch { /* ignore */ }
-        // Update checkpoint to current state + now, so when we return,
-        // offline calc starts from exactly here
         if (stateRef.current.isWorking) {
-          saveCheckpoint(stateRef.current);
+          saveWorkCheckpoint(stateRef.current);
         }
+        // Recovery checkpoint stays as-is (startTimestamp is authoritative)
+        // No need to update it — the existing timestamp is correct
       } else {
-        // Tab visible again — apply offline progress since the checkpoint
-        const checkpoint = loadCheckpoint();
-        if (!checkpoint) return;
-
         const nowMs = Date.now();
-        const elapsed = nowMs - checkpoint.timestamp;
-        if (elapsed < 2000) return; // Less than 2s, ignore
+        let current = stateRef.current;
 
-        const { state: result, elapsedSecs, shiftsCompleted } = applyOfflineProgress(
-          stateRef.current,
-          checkpoint,
-          nowMs,
-        );
-
-        const finalState: GameState = {
-          ...result,
-          activeRecovery: stateRef.current.activeRecovery,
-          recoveryProgress: stateRef.current.recoveryProgress,
-          recoveryMax: stateRef.current.recoveryMax,
-        };
-
-        setState(finalState);
-        stateRef.current = finalState;
-
-        if (elapsedSecs > 5) {
-          addLog(
-            `Back! Away ${fmtTime(Math.round(elapsedSecs))}${shiftsCompleted > 0 ? ` · ${shiftsCompleted} shift(s) done` : ""}.`,
-            P.green,
-          );
+        // Apply offline work progress
+        const workCheckpoint = loadWorkCheckpoint();
+        if (workCheckpoint) {
+          const elapsed = nowMs - workCheckpoint.timestamp;
+          if (elapsed >= 2000) {
+            const { state: result, elapsedSecs, shiftsCompleted } = applyOfflineWorkProgress(current, workCheckpoint, nowMs);
+            current = {
+              ...result,
+              activeRecovery: stateRef.current.activeRecovery,
+              recoveryProgress: stateRef.current.recoveryProgress,
+              recoveryMax: stateRef.current.recoveryMax,
+            };
+            if (elapsedSecs > 5) {
+              addLog(`Back! Away ${fmtTime(Math.round(elapsedSecs))}${shiftsCompleted > 0 ? ` · ${shiftsCompleted} shift(s) done` : ""}.`, P.green);
+            }
+            if (current.isWorking) {
+              saveWorkCheckpoint(current);
+            } else {
+              clearWorkCheckpoint();
+            }
+          }
         }
 
-        // Refresh checkpoint to now
-        if (finalState.isWorking) {
-          saveCheckpoint(finalState);
-        } else {
-          clearCheckpoint();
+        // Apply offline recovery progress
+        const recoveryCheckpoint = loadRecoveryCheckpoint();
+        if (recoveryCheckpoint) {
+          const { state: recResult, logMsg, logColor } = applyOfflineRecoveryProgress(current, recoveryCheckpoint, nowMs);
+          current = recResult;
+          if (!current.activeRecovery) {
+            clearRecoveryCheckpoint();
+          }
+          if (logMsg) addLog(logMsg, logColor);
         }
+
+        setState(current);
+        stateRef.current = current;
       }
     };
     document.addEventListener("visibilitychange", onVis);
     return () => document.removeEventListener("visibilitychange", onVis);
   }, [addLog]);
 
-  // ── Main tick loop — purely in-memory, no checkpoint interaction ──────────
-  // Runs every TICK_MS. Accumulates fractional seconds for precise math.
-  const accumulatorRef = useRef<number>(0);
-
+  // ── Main tick loop ────────────────────────────────────────────────────────
   useEffect(() => {
     const t = setInterval((): void => {
       setState((prev: GameState): GameState => {
         const dt = TICK_MS / 1000;
-        const focusReduction = 0.60;
-        const lunchReduction = 0.50;
 
         const isFrozen = (() => {
           const act = RECOVERY_ACTIONS.find((a: RecoveryAction) => a.id === prev.activeRecovery);
@@ -876,13 +959,13 @@ export default function IdleWorkerGame() {
 
         let next: GameState = { ...prev };
 
-        // Productivity decay (always, unless meditating)
+        // Productivity decay
         if (!isFrozen) {
-          next.multiplier = Math.max(0, prev.multiplier - MULTIPLIER_DECAY_PER_SEC * (1 - focusReduction) * dt);
+          next.multiplier = Math.max(0, prev.multiplier - MULTIPLIER_DECAY_PER_SEC * dt);
         }
 
-        // Energy decay (hunger/thirst — always)
-        next.energy = Math.max(0, prev.energy - ENERGY_DECAY_PER_SEC * (1 - lunchReduction) * dt);
+        // Energy decay
+        next.energy = Math.max(0, prev.energy - ENERGY_DECAY_PER_SEC * dt);
         if (next.energy < 5 && prev.energy >= 5 && !prev._warnedEnergy) {
           next._warnedEnergy = true;
           next._energyWarn   = true;
@@ -891,8 +974,7 @@ export default function IdleWorkerGame() {
 
         // Work tick
         if (prev.isWorking) {
-          const drainReduction = 0.60;
-          next.mana        = Math.max(0, prev.mana - MANA_DRAIN_PER_SEC * (1 - drainReduction) * dt);
+          next.mana        = Math.max(0, prev.mana - MANA_DRAIN_PER_SEC * dt);
           next.workProgress = (prev.workProgress + dt) % 5;
 
           const newWorkSeconds      = prev.workSeconds + dt;
@@ -900,15 +982,13 @@ export default function IdleWorkerGame() {
           next.workSeconds      = newWorkSeconds;
           next.totalWorkSeconds = newTotalWorkSeconds;
 
-          const level       = levelFromSecs(newTotalWorkSeconds);
-          const speedBonus  = 1;
-          const baseIncome  = BASE_INCOME_PER_SEC + (prev.incomePerSecond || 0) * 0.5;
+          const level        = levelFromSecs(newTotalWorkSeconds);
+          const baseIncome   = BASE_INCOME_PER_SEC + (prev.incomePerSecond || 0) * 0.5;
           const energyFactor = Math.max(0, next.energy / 100);
           const prodFactor   = next.multiplier / 100;
-          const perTick = baseIncome * speedBonus * prodFactor * energyFactor * levelIncomeMultiplier(level) * dt;
+          const perTick = baseIncome * prodFactor * energyFactor * levelIncomeMultiplier(level) * dt;
           next.currency += perTick;
 
-          // Shift completion → trigger gambling
           if (newWorkSeconds >= MAX_SHIFT_SECS && prev.workSeconds < MAX_SHIFT_SECS) {
             const deskBonus = (prev.ergonomicDesk || 0) * 100;
             const baseBonus = (SHIFT_COMPLETION_BONUS + deskBonus) * (next.multiplier / 100);
@@ -917,8 +997,7 @@ export default function IdleWorkerGame() {
             next.workSeconds        = 0;
             next.workProgress       = 0;
             next.pendingGamble      = { baseBonus };
-            // Work ended — clear the checkpoint
-            clearCheckpoint();
+            clearWorkCheckpoint();
           }
 
           if (next.mana <= 0) {
@@ -926,7 +1005,7 @@ export default function IdleWorkerGame() {
             next.workSeconds  = 0;
             next.workProgress = 0;
             next._stopWork    = true;
-            clearCheckpoint();
+            clearWorkCheckpoint();
           }
         }
 
@@ -938,6 +1017,8 @@ export default function IdleWorkerGame() {
             if (action) {
               const applied = action.apply(prev);
               next = { ...next, ...applied, activeRecovery: null, recoveryProgress: 0, recoveryMax: 0 };
+              // Recovery done — clear checkpoint (side effect outside setState is fine)
+              clearRecoveryCheckpoint();
             }
           } else {
             next.recoveryProgress = newProg;
@@ -991,8 +1072,7 @@ export default function IdleWorkerGame() {
   // ── Handlers ──────────────────────────────────────────────────────────────
   const toggleWork = (): void => {
     if (state.isWorking) {
-      // Pause: clear checkpoint since work is no longer running
-      clearCheckpoint();
+      clearWorkCheckpoint();
       setState((p: GameState) => ({ ...p, isWorking: false }));
       addLog("Work paused.", P.muted);
       return;
@@ -1001,9 +1081,8 @@ export default function IdleWorkerGame() {
     if (state.activeRecovery)  { addLog("Finish your recovery first.", P.yellow);              return; }
     if (state.pendingGamble)   { addLog("Collect your shift bonus first!", P.yellow);          return; }
 
-    // Save checkpoint BEFORE updating state, capturing the current moment
     const startingState = { ...state, isWorking: true };
-    saveCheckpoint(startingState);
+    saveWorkCheckpoint(startingState);
 
     setState((p: GameState) => ({ ...p, isWorking: true }));
     addLog(`Shift started! Energy affects income — keep it up! ${fmtTime(MAX_SHIFT_SECS - state.workSeconds)} remaining.`, P.green);
@@ -1024,11 +1103,25 @@ export default function IdleWorkerGame() {
       else                     addLog("Can't do that right now.", P.red);
       return;
     }
-    setState((p: GameState) => ({ ...p, activeRecovery: id, recoveryProgress: 0, recoveryMax: action.duration }));
-    addLog(`${action.name} started. (~${action.realTime})`, action.color);
+
+    // Deduct currency cost immediately (so offline apply doesn't double-deduct)
+    const stateForCheckpoint: GameState = {
+      ...state,
+      currency: action.currencyCost ? state.currency - action.currencyCost : state.currency,
+      activeRecovery: id,
+      recoveryProgress: 0,
+      recoveryMax: action.duration,
+    };
+
+    // Save recovery checkpoint BEFORE updating state
+    saveRecoveryCheckpoint(id, stateForCheckpoint);
+
+    setState((_p: GameState) => stateForCheckpoint);
+    addLog(`${action.name} started. (~${action.realTime}) — continues in background!`, action.color);
   };
 
   const cancelRecovery = (): void => {
+    clearRecoveryCheckpoint();
     setState((p: GameState) => ({ ...p, activeRecovery: null, recoveryProgress: 0, recoveryMax: 0 }));
     addLog("Recovery cancelled.", P.muted);
   };
@@ -1052,7 +1145,8 @@ export default function IdleWorkerGame() {
   const importSave = (): void => {
     const d = decodeState(importStr.trim());
     if (d) {
-      clearCheckpoint();
+      clearWorkCheckpoint();
+      clearRecoveryCheckpoint();
       setState({ ...INITIAL_STATE, ...d, isWorking: false, activeRecovery: null, pendingGamble: null });
       addLog("Save imported!", P.green);
       setSaveStatus("Loaded!");
@@ -1063,7 +1157,8 @@ export default function IdleWorkerGame() {
   };
 
   const resetGame = (): void => {
-    clearCheckpoint();
+    clearWorkCheckpoint();
+    clearRecoveryCheckpoint();
     localStorage.removeItem(SAVE_KEY);
     setState(INITIAL_STATE);
     setLog([{ id: 0, text: "Game reset. Fresh start!", color: P.muted }]);
@@ -1148,6 +1243,13 @@ export default function IdleWorkerGame() {
               style={{ display: "flex", alignItems: "center", gap: 4 }}>
               <div style={{ width: 6, height: 6, borderRadius: "50%", background: P.green }} />
               <span style={{ fontSize: 10, color: P.green, fontFamily: F.mono }}>WORKING</span>
+            </motion.div>
+          )}
+          {state.activeRecovery && !state.isWorking && (
+            <motion.div animate={{ opacity: [1, 0.4, 1] }} transition={{ repeat: Infinity, duration: 1.4 }}
+              style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <div style={{ width: 6, height: 6, borderRadius: "50%", background: P.purple }} />
+              <span style={{ fontSize: 10, color: P.purple, fontFamily: F.mono }}>RECOVERING</span>
             </motion.div>
           )}
           <motion.div animate={levelUpAnim ? { scale: [1, 1.3, 1], rotate: [0, 8, -8, 0] } : {}}
@@ -1311,7 +1413,7 @@ export default function IdleWorkerGame() {
                   {state.workSeconds > 0 && !state.isWorking && (
                     <button
                       onClick={() => {
-                        clearCheckpoint();
+                        clearWorkCheckpoint();
                         setState((p: GameState) => ({ ...p, workSeconds: 0, workProgress: 0 }));
                         addLog("Shift abandoned.", P.muted);
                       }}
@@ -1350,12 +1452,17 @@ export default function IdleWorkerGame() {
                   return (
                     <motion.div initial={{ opacity: 0, scale: 0.97 }} animate={{ opacity: 1, scale: 1 }}
                       style={{ ...card, border: `1px solid ${act.color}`, marginBottom: 14 }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                           <act.icon size={14} color={act.color} />
                           <span style={{ fontFamily: F.display, fontWeight: 700, fontSize: 14, color: act.color }}>{act.name}</span>
                         </div>
                         <span style={{ fontSize: 11, fontFamily: F.mono, color: P.muted }}>{fmtTime(timeLeft)} left</span>
+                      </div>
+                      {/* Offline-persistent indicator */}
+                      <div style={{ fontSize: 10, color: P.muted, marginBottom: 8, display: "flex", alignItems: "center", gap: 4 }}>
+                        <span style={{ width: 5, height: 5, borderRadius: "50%", background: act.color, display: "inline-block" }} />
+                        Continues in background — close the browser and come back!
                       </div>
                       <div style={{ height: 7, background: "#1e2435", borderRadius: 4, overflow: "hidden", marginBottom: 10 }}>
                         <motion.div animate={{ width: `${pct}%` }} transition={{ duration: 0.25 }} style={{ height: "100%", background: act.color, borderRadius: 4 }} />
@@ -1446,7 +1553,9 @@ export default function IdleWorkerGame() {
               <div>
                 <div style={card}>
                   <div style={{ fontFamily: F.display, fontWeight: 700, fontSize: 14, marginBottom: 10 }}>Save & Export</div>
-                  <div style={{ fontSize: 12, color: P.muted, marginBottom: 14, lineHeight: 1.6 }}>Auto-saves every 10 seconds. A work checkpoint is saved when you start a shift — offline progress is calculated exactly from that point on reload.</div>
+                  <div style={{ fontSize: 12, color: P.muted, marginBottom: 14, lineHeight: 1.6 }}>
+                    Auto-saves every 10 seconds. Work <em>and</em> recovery checkpoints are saved when they start — if you close the browser, both continue in the background and are applied when you return.
+                  </div>
                   <motion.button whileTap={{ scale: 0.97 }} style={{ ...bigBtn(P.accent), marginTop: 0, marginBottom: 10 }} onClick={exportSave}>
                     <Download size={15} /> Export Save
                   </motion.button>
