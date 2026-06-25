@@ -445,10 +445,10 @@ function simulateSeconds(
   seconds: number,
   onShiftComplete?: (baseBonus: number) => void,
 ): GameState {
-  const drainReduction = Math.min((s.espressoMachine || 0) * 0.10, 0.60);
-  const focusReduction = Math.min((s.deepFocusGuide  || 0) * 0.10, 0.60);
-  const lunchReduction = Math.min((s.lunchBox        || 0) * 0.10, 0.50);
-  const speedBonus     = 1 + (s.automationSpeed || 0) * 0.25;
+  const drainReduction = Math.min((0) * 0.10, 0.60);
+  const focusReduction = Math.min((0) * 0.10, 0.60);
+  const lunchReduction = Math.min((0) * 0.10, 0.50);
+  const speedBonus     = 1;
   const baseIncome     = BASE_INCOME_PER_SEC + (s.incomePerSecond || 0) * 0.5;
 
   let { mana, multiplier, energy, currency, workSeconds, totalWorkSeconds, completedCycles } = s;
@@ -866,8 +866,8 @@ export default function IdleWorkerGame() {
     const t = setInterval((): void => {
       setState((prev: GameState): GameState => {
         const dt = TICK_MS / 1000;
-        const focusReduction = Math.min((prev.deepFocusGuide || 0) * 0.10, 0.60);
-        const lunchReduction = Math.min((prev.lunchBox       || 0) * 0.10, 0.50);
+        const focusReduction = 0.60;
+        const lunchReduction = 0.50;
 
         const isFrozen = (() => {
           const act = RECOVERY_ACTIONS.find((a: RecoveryAction) => a.id === prev.activeRecovery);
@@ -891,7 +891,7 @@ export default function IdleWorkerGame() {
 
         // Work tick
         if (prev.isWorking) {
-          const drainReduction = Math.min((prev.espressoMachine || 0) * 0.10, 0.60);
+          const drainReduction = 0.60;
           next.mana        = Math.max(0, prev.mana - MANA_DRAIN_PER_SEC * (1 - drainReduction) * dt);
           next.workProgress = (prev.workProgress + dt) % 5;
 
@@ -901,7 +901,7 @@ export default function IdleWorkerGame() {
           next.totalWorkSeconds = newTotalWorkSeconds;
 
           const level       = levelFromSecs(newTotalWorkSeconds);
-          const speedBonus  = 1 + (prev.automationSpeed || 0) * 0.25;
+          const speedBonus  = 1;
           const baseIncome  = BASE_INCOME_PER_SEC + (prev.incomePerSecond || 0) * 0.5;
           const energyFactor = Math.max(0, next.energy / 100);
           const prodFactor   = next.multiplier / 100;
@@ -1087,7 +1087,6 @@ export default function IdleWorkerGame() {
   const manaColor     = state.mana > 50 ? P.mana : state.mana > 20 ? P.yellow : P.red;
   const energyFactor  = Math.max(0, state.energy / 100);
   const baseIncomeSec = (BASE_INCOME_PER_SEC + (state.incomePerSecond || 0) * 0.5)
-    * (1 + (state.automationSpeed || 0) * 0.25)
     * (state.multiplier / 100)
     * energyFactor
     * levelIncomeMultiplier(curLevel);
